@@ -11,13 +11,12 @@ import streamlit as st
 
 # ======================== CONFIG & CONSTANTS ========================
 st.set_page_config(
-    page_title="Polymarket Dual Signal Scanner (CS2 & Dota 2)",
-    page_icon="⚡",
+    page_title="Polymarket CS2 Signal Scanner",
+    page_icon="🎮",
     layout="wide",
 )
 
 DEFAULT_CS2_WALLET = "0xc9bfc7986767173b4f1c3fc9b2c6b255fc7381c0"
-DEFAULT_DOTA_WALLET = "0x3231d2d67053e5dc3715f6429124741e52866e75"
 
 DATA_API_BASE = "https://data-api.polymarket.com"
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
@@ -272,9 +271,9 @@ def safe_float(val, default: float = 0.0) -> float:
         return default
 
 
-def parse_time_info(raw_ts) -> tuple[str, float | None]:
+def parse_time_info(raw_ts) -> str:
     if not raw_ts:
-        return "—", None
+        return "—"
     try:
         if isinstance(raw_ts, (int, float)):
             ts = float(raw_ts)
@@ -296,17 +295,17 @@ def parse_time_info(raw_ts) -> tuple[str, float | None]:
         age_mins = max(0.0, diff.total_seconds() / 60.0)
         mins = int(age_mins)
         if mins < 1:
-            return "Vừa xong ⚡", round(age_mins, 1)
+            return "Vừa xong ⚡"
         if mins < 60:
-            return f"{mins}p trước", round(age_mins, 1)
+            return f"{mins}p trước"
         hours = mins // 60
         rem_mins = mins % 60
         if hours < 24:
-            return f"{hours}h{rem_mins:02d}p trước", round(age_mins, 1)
+            return f"{hours}h{rem_mins:02d}p trước"
         days = hours // 24
-        return f"{days}d {hours % 24}h trước", round(age_mins, 1)
+        return f"{days}d {hours % 24}h trước"
     except Exception:
-        return "—", None
+        return "—"
 
 
 def normalize_team_name(name: str) -> str:
@@ -316,7 +315,7 @@ def normalize_team_name(name: str) -> str:
 
 def extract_team_pair(title: str) -> frozenset[str] | None:
     clean = re.sub(
-        r"^(Counter-Strike|CS2|Dota\s*2|Map\s*\d+\s*Rounds\s*Handicap|Map\s*\d+\s*Winner|Game\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
+        r"^(Counter-Strike|CS2|Map\s*\d+\s*Rounds\s*Handicap|Map\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
         "",
         title,
         flags=re.IGNORECASE,
@@ -354,28 +353,28 @@ def matches_blocked_league(
     return False, ""
 
 
-def passes_required_market_substrings(title: str, req_substrings: list[str]) -> bool:
-    if not req_substrings:
-        return True
-    t_low = title.lower()
-    return any(sub in t_low for sub in req_substrings)
-
-
-def prepare_wallet_candidates(
-    profile_cfg: dict,
+def evaluate_cs2_positions(
+    cfg: dict,
     open_positions: list[dict],
-    gamma_cache: dict[str, dict],
-) -> tuple[list[dict], list[str]]:
-    source_tag = profile_cfg["source_tag"]
-    wallet = profile_cfg["wallet"]
-    multiplier = float(profile_cfg["multiplier"])
-    min_user_bet = float(profile_cfg["min_user_bet"])
-    min_prob_pct = int(profile_cfg["min_prob_pct"])
-    max_fav_prob = int(profile_cfg["max_fav_prob"])
-    block_50_60 = bool(profile_cfg["block_50_60"])
-    detect_hedge = bool(profile_cfg["detect_hedge"])
-    blocked_keywords = profile_cfg["blocked_keywords"]
-    req_substrings = profile_cfg.get("required_market_substrings") or []
+    redeem_positions: list[dict],
+) -> dict:
+    if "gamma_meta_cache" not in st.session_state:
+        st.session_state["gamma_meta_cache"] = {}
+
+    all_cids = [str(p.get("condition_id") or p.get("conditionId") or "").strip() for p in open_positions]
+    all_tids = [str(p.get("token_id") or p.get("asset") or "").strip() for p in open_positions]
+    gamma_cache = fetch_gamma_events_meta(all_cids, all_tids, st.session_state["gamma_meta_cache"])
+
+    wallet = cfg["wallet"]
+    multiplier = float(cfg["multiplier"])
+    min_user_bet = float(cfg["min_user_bet"])
+    max_user_cap = float(cfg["max_user_cap"])
+    max_slippage_cents = float(cfg["max_slippage_cents"])
+    drop_warn_cents = float(cfg["drop_warn_cents"])
+    max_fav_prob = int(cfg["max_fav_prob"])
+    block_50_60 = bool(cfg["block_50_60"])
+    detect_hedge = bool(cfg["detect_hedge"])
+    blocked_keywords = cfg["blocked_keywords"]
 
     parsed_rows: list[dict] = []
     blocked_team_pairs: set[frozenset[str]] = set()
@@ -426,7 +425,7 @@ def prepare_wallet_candidates(
             or p.get("created_at")
             or p.get("timestamp")
         )
-        last_ago_str, age_mins = parse_time_info(last_ts)
+        last_ago_str = parse_time_info(last_ts)
         url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
         combined_text = f"{title} | {ev_title} | {slug} | {ev_slug}"
@@ -435,12 +434,8 @@ def prepare_wallet_candidates(
         if is_blk and team_pair:
             blocked_team_pairs.add(team_pair)
 
-        mkt_type_ok = passes_required_market_substrings(title, req_substrings)
-
         parsed_rows.append(
             {
-                "source_tag": source_tag,
-                "profile_cfg": profile_cfg,
                 "pos_key": pos_key,
                 "condition_id": cid,
                 "token_id": tid,
@@ -454,15 +449,14 @@ def prepare_wallet_candidates(
                 "entry_cost_usdc": entry_cost,
                 "total_pnl": total_pnl,
                 "last_buy_ago": last_ago_str,
-                "age_mins": age_mins,
                 "gamma_unverified": gamma_unverified,
                 "is_blocked_direct": is_blk,
                 "blocked_reason": blk_reason,
                 "team_pair": team_pair,
-                "mkt_type_ok": mkt_type_ok,
             }
         )
 
+    # Khóa chéo các kèo phụ (Map 1/2, Handicap...) cùng cặp đội thuộc giải chặn
     for row in parsed_rows:
         if not row["is_blocked_direct"] and row["team_pair"] and row["team_pair"] in blocked_team_pairs:
             row["is_blocked_direct"] = True
@@ -480,47 +474,19 @@ def prepare_wallet_candidates(
             continue
         if row["is_blocked_direct"]:
             continue
-        if not row["mkt_type_ok"]:
-            continue
         if detect_hedge and row["cid_outcome_cnt"] >= 2:
             continue
         raw_bet = row["entry_cost_usdc"] * multiplier
         if raw_bet < min_user_bet:
             continue
         avg_p = row["avg_price"]
-        if avg_p <= 0.0 or avg_p < (min_prob_pct / 100.0) or avg_p > (max_fav_prob / 100.0):
+        if avg_p <= 0.0 or avg_p > (max_fav_prob / 100.0):
             continue
         if block_50_60 and (0.50 <= avg_p <= 0.60):
             continue
         candidate_tids.append(row["token_id"])
 
-    return parsed_rows, candidate_tids
-
-
-def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]]]) -> dict:
-    if "gamma_meta_cache" not in st.session_state:
-        st.session_state["gamma_meta_cache"] = {}
-
-    all_cids: list[str] = []
-    all_tids: list[str] = []
-    for _, open_pos, _ in profiles_data:
-        for p in open_pos:
-            all_cids.append(str(p.get("condition_id") or p.get("conditionId") or "").strip())
-            all_tids.append(str(p.get("token_id") or p.get("asset") or "").strip())
-
-    gamma_cache = fetch_gamma_events_meta(all_cids, all_tids, st.session_state["gamma_meta_cache"])
-
-    all_parsed_rows: list[dict] = []
-    all_candidate_tids: list[str] = []
-    total_redeemable = 0
-
-    for p_cfg, open_pos, redeem_pos in profiles_data:
-        total_redeemable += len(redeem_pos)
-        rows, cand_tids = prepare_wallet_candidates(p_cfg, open_pos, gamma_cache)
-        all_parsed_rows.extend(rows)
-        all_candidate_tids.extend(cand_tids)
-
-    books_map = fetch_clob_books(all_candidate_tids)
+    books_map = fetch_clob_books(candidate_tids)
 
     valid_list: list[dict] = []
     slip_list: list[dict] = []
@@ -529,19 +495,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
     rejected_list: list[dict] = []
     dead_zero_count = 0
 
-    for row in all_parsed_rows:
-        p_cfg = row["profile_cfg"]
-        multiplier = float(p_cfg["multiplier"])
-        min_user_bet = float(p_cfg["min_user_bet"])
-        max_user_cap = float(p_cfg["max_user_cap"])
-        max_slippage_cents = float(p_cfg["max_slippage_cents"])
-        drop_warn_cents = float(p_cfg["drop_warn_cents"])
-        min_prob_pct = int(p_cfg["min_prob_pct"])
-        max_fav_prob = int(p_cfg["max_fav_prob"])
-        block_50_60 = bool(p_cfg["block_50_60"])
-        detect_hedge = bool(p_cfg["detect_hedge"])
-        max_signal_age_mins = int(p_cfg.get("max_signal_age_mins", 0))
-
+    for row in parsed_rows:
         cur_p = row["cur_price"]
         avg_p = row["avg_price"]
         entry_cost = row["entry_cost_usdc"]
@@ -556,15 +510,15 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 2. Giải chặn (CCT Europe cho CS2 / Streamer & Media Eleague cho Dota)
+        # 2. Giải chặn (CCT Europe)
         if row["is_blocked_direct"]:
             cond_notes = []
             if raw_bet < min_user_bet:
                 cond_notes.append(f"< Min ${min_user_bet:.2f}")
             if block_50_60 and (0.50 <= avg_p <= 0.60):
                 cond_notes.append("Dải 50-60%")
-            elif avg_p > (max_fav_prob / 100.0) or avg_p < (min_prob_pct / 100.0):
-                cond_notes.append(f"Ngoài dải {min_prob_pct}-{max_fav_prob}%")
+            elif avg_p > (max_fav_prob / 100.0):
+                cond_notes.append(f"> {max_fav_prob}%")
             row["raw_user_bet"] = round(raw_bet, 2)
             row["other_cond"] = (
                 f"Đạt vốn & giá ({row['blocked_reason']})"
@@ -574,20 +528,14 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             blocked_list.append(row)
             continue
 
-        # 3. Bộ lọc loại kèo (ví dụ Dota chỉ đánh Game 1 & Game 2 Winner)
-        if not row["mkt_type_ok"]:
-            row["reject_reason"] = "Loại kèo (Chỉ lấy Game 1/2 Winner)"
-            rejected_list.append(row)
-            continue
-
-        # 4. Hedge 2 đầu trên cùng condition_id
+        # 3. Hedge 2 đầu trên cùng condition_id
         if detect_hedge and row["cid_outcome_cnt"] >= 2:
             row["raw_user_bet"] = round(raw_bet, 2)
             row["hedge_note"] = "Ví gốc đang mở >= 2 cửa cùng trận"
             hedge_list.append(row)
             continue
 
-        # 5. Ngưỡng vốn tối thiểu
+        # 4. Ngưỡng vốn tối thiểu
         if raw_bet < min_user_bet:
             min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0
             row["reject_reason"] = (
@@ -596,9 +544,9 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 6. Bộ lọc dải xác suất theo từng chiến lược
-        if avg_p <= 0.0 or avg_p < (min_prob_pct / 100.0):
-            row["reject_reason"] = f"Kèo Underdog sâu < {min_prob_pct}% ({avg_p * 100:.1f}¢)"
+        # 5. Bộ lọc dải xác suất
+        if avg_p <= 0.0:
+            row["reject_reason"] = "Giá mua không hợp lệ (0¢)"
             rejected_list.append(row)
             continue
         if avg_p > (max_fav_prob / 100.0):
@@ -610,7 +558,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
             rejected_list.append(row)
             continue
 
-        # 7. Đánh giá sổ lệnh CLOB & Độ trễ Taker
+        # 6. Đánh giá sổ lệnh CLOB
         max_limit_price = min(avg_p + (max_slippage_cents / 100.0), 0.99)
         max_limit_cents = round(max_limit_price * 100.0, 1)
 
@@ -625,13 +573,6 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
         parsed_asks.sort(key=lambda x: x[0])
 
         notes: list[str] = []
-        age_mins = row.get("age_mins")
-        if max_signal_age_mins > 0 and age_mins is not None:
-            if age_mins <= 5.0:
-                notes.append(f"⚡ Mới {age_mins:.0f}p")
-            elif age_mins > max_signal_age_mins:
-                notes.append(f"⏱️ Trễ {age_mins:.0f}p — CHECK IN-GAME!")
-
         if row["gamma_unverified"]:
             notes.append("⚠️ Chưa xác minh giải (Gamma)")
 
@@ -686,7 +627,7 @@ def evaluate_all_profiles(profiles_data: list[tuple[dict, list[dict], list[dict]
         "hedge": pd.DataFrame(hedge_list),
         "blocked": pd.DataFrame(blocked_list),
         "rejected": pd.DataFrame(rejected_list),
-        "redeemable_count": total_redeemable,
+        "redeemable_count": len(redeem_positions),
         "dead_zero_count": dead_zero_count,
     }
 
@@ -702,121 +643,51 @@ if "last_scan_time" not in st.session_state:
     st.session_state["last_scan_time"] = None
 
 
-# ======================== SIDEBAR CONFIG (2 PROFILES) ========================
+# ======================== SIDEBAR CONFIG (CS2 ONLY) ========================
 with st.sidebar:
-    st.header("🎛️ Cấu Hình 2 Chiến Lược Signal")
+    st.header("🎮 Cấu Hình Chiến Lược CS2")
 
-    # --- PROFILE 1: CS2 ---
-    with st.expander("🎮 Ví 1: CS2 Whale (Pre-Match)", expanded=False):
-        enable_cs2 = st.checkbox("Bật quét ví CS2", value=True, key="en_cs2")
-        cs2_wallet_raw = st.text_input(
-            "Địa chỉ ví CS2",
-            value=DEFAULT_CS2_WALLET,
-            key="w_cs2",
-        ).strip()
+    cs2_wallet_raw = st.text_input(
+        "Địa chỉ ví CS2 Whale",
+        value=DEFAULT_CS2_WALLET,
+        key="w_cs2",
+    ).strip()
 
-        cs2_mult = st.number_input(
-            "Hệ số nhân CS2",
-            min_value=0.00001,
-            max_value=1.0,
-            value=0.00100,
-            step=0.00010,
-            format="%.5f",
-            key="m_cs2",
-        )
-        c1_a, c1_b = st.columns(2)
-        cs2_min_bet = c1_a.number_input(
-            "Min lệnh ($)",
-            min_value=0.1,
-            value=2.00,
-            step=0.5,
-            key="min_cs2",
-        )
-        cs2_max_cap = c1_b.number_input(
-            "Trần tối đa ($)",
-            min_value=1.0,
-            value=20.00,
-            step=1.0,
-            key="max_cs2",
-        )
-        cs2_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_cs2")
-        cs2_drop_warn = st.slider("Cảnh báo giá tụt sâu (¢)", 2.0, 15.0, 5.0, 1.0, key="drop_cs2")
-        cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
-        cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
-        cs2_blocked_kw = st.text_input("Giải chặn (CS2)", value="CCT Europe", key="blk_cs2")
-        cs2_min_whale = cs2_min_bet / cs2_mult if cs2_mult > 0 else 0
-        cs2_max_whale = cs2_max_cap / cs2_mult if cs2_mult > 0 else 0
-        st.caption(f"Ngưỡng ví CS2: **${cs2_min_whale:,.0f} – ${cs2_max_whale:,.0f}**")
+    cs2_mult = st.number_input(
+        "Hệ số nhân vốn",
+        min_value=0.00001,
+        max_value=1.0,
+        value=0.00100,
+        step=0.00010,
+        format="%.5f",
+        key="m_cs2",
+    )
+    c1, c2 = st.columns(2)
+    cs2_min_bet = c1.number_input(
+        "Min lệnh ($)",
+        min_value=0.1,
+        value=2.00,
+        step=0.5,
+        key="min_cs2",
+    )
+    cs2_max_cap = c2.number_input(
+        "Trần tối đa ($)",
+        min_value=1.0,
+        value=20.00,
+        step=1.0,
+        key="max_cs2",
+    )
 
-    # --- PROFILE 2: DOTA 2 (TRIAL TUNED) ---
-    with st.expander("🐉 Ví 2: DotaBotReborn (Thử nghiệm Bot)", expanded=True):
-        enable_dota = st.checkbox("Bật quét ví Dota 2", value=True, key="en_dota")
-        dota_wallet_raw = st.text_input(
-            "Địa chỉ ví Dota 2",
-            value=DEFAULT_DOTA_WALLET,
-            key="w_dota",
-        ).strip()
+    cs2_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_cs2")
+    cs2_drop_warn = st.slider("Cảnh báo giá tụt sâu (¢)", 2.0, 15.0, 5.0, 1.0, key="drop_cs2")
+    cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
+    cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
+    detect_hedge = st.checkbox("Chặn kèo ví gốc Hedge 2 đầu", value=True, key="hedge_cs2")
+    cs2_blocked_kw = st.text_input("Giải chặn (cách nhau dấu phẩy)", value="CCT Europe", key="blk_cs2")
 
-        dota_mult = st.number_input(
-            "Hệ số nhân Dota (Thử nghiệm)",
-            min_value=0.00001,
-            max_value=1.0,
-            value=0.00250,
-            step=0.00050,
-            format="%.5f",
-            key="m_dota",
-            help="0.00250 cho giai đoạn thử nghiệm: lệnh $400 ví gốc -> $1.00; lệnh $4,000+ -> chạm trần $10.00.",
-        )
-        c2_a, c2_b = st.columns(2)
-        dota_min_bet = c2_a.number_input(
-            "Min lệnh ($)",
-            min_value=0.1,
-            value=1.00,
-            step=0.5,
-            key="min_dota",
-            help="0.00250 × $400 = $1.00 (lọc sạch các lệnh thăm dò < $400).",
-        )
-        dota_max_cap = c2_b.number_input(
-            "Trần tối đa ($)",
-            min_value=1.0,
-            value=10.00,
-            step=1.0,
-            key="max_dota",
-            help="Khóa trần $10.00/kèo (1% vốn $1,000) trong giai đoạn thử nghiệm.",
-        )
-        dota_g12_only = st.checkbox(
-            "Chỉ lấy Game 1 & Game 2 Winner",
-            value=True,
-            key="g12_dota",
-            help="Khuyên bật: Game 1/2 giữ +19.5% đến +23.9% ROI sau trượt giá, loại bỏ BO3 Match Winner dễ dính lệnh in-play.",
-        )
-        dota_blocked_kw = st.text_input(
-            "Giải chặn (Dota)",
-            value="Streamer, Media Eleague",
-            key="blk_dota",
-            help="Chặn các giải biểu diễn của streamer Nga biến động bất thường.",
-        )
-        dota_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_dota")
-        dota_age_warn = st.slider(
-            "Cảnh báo trễ lệnh sau (phút)",
-            3,
-            30,
-            10,
-            1,
-            key="age_dota",
-        )
-        c2_p1, c2_p2 = st.columns(2)
-        dota_min_prob = c2_p1.number_input("Dải giá từ (%)", 5, 60, 35, 5, key="minp_dota")
-        dota_max_fav = c2_p2.number_input("Đến tối đa (%)", 50, 95, 70, 5, key="maxp_dota")
-        dota_block_50_60 = st.checkbox("Chặn dải 50% – 60% (Dota)", value=False, key="b5060_dota")
-
-        dota_min_whale = dota_min_bet / dota_mult if dota_mult > 0 else 0
-        dota_max_whale = dota_max_cap / dota_mult if dota_mult > 0 else 0
-        st.caption(
-            f"Ngưỡng ví Dota: **${dota_min_whale:,.0f} – ${dota_max_whale:,.0f}** | Dải **{dota_min_prob}%–{dota_max_fav}%**"
-        )
-
-    detect_hedge_global = st.checkbox("Chặn kèo ví gốc Hedge 2 đầu (Chung)", value=True)
+    cs2_min_whale = cs2_min_bet / cs2_mult if cs2_mult > 0 else 0
+    cs2_max_whale = cs2_max_cap / cs2_mult if cs2_mult > 0 else 0
+    st.caption(f"Ngưỡng vốn ví gốc: **${cs2_min_whale:,.0f} – ${cs2_max_whale:,.0f}**")
 
     st.divider()
     if st.session_state["entered_ids"]:
@@ -831,71 +702,34 @@ with st.sidebar:
 
 
 # ======================== MAIN UI ========================
-st.title("⚡ Trạm Quét Tín Hiệu Copy-Trade (CS2 + Dota 2)")
+st.title("🎮 Trạm Quét Tín Hiệu Copy-Trade CS2")
 
 col_btn, col_time = st.columns([2, 3])
-scan_clicked = col_btn.button("🚀 QUÉT TÍN HIỆU HỢP LỆ NGAY", type="primary", use_container_width=True)
+scan_clicked = col_btn.button("🚀 QUÉT TÍN HIỆU CS2 NGAY", type="primary", use_container_width=True)
 
 if scan_clicked or st.session_state["scan_results"] is None:
-    with st.spinner("Đang kéo dữ liệu Polymarket Data API v2, Gamma & Sổ lệnh CLOB..."):
-        active_profiles: list[dict] = []
-
-        if enable_cs2 and EVM_ADDR_RE.match(cs2_wallet_raw):
-            active_profiles.append(
-                {
-                    "source_tag": "🎮 CS2",
-                    "wallet": cs2_wallet_raw.lower(),
-                    "multiplier": cs2_mult,
-                    "min_user_bet": cs2_min_bet,
-                    "max_user_cap": cs2_max_cap,
-                    "max_slippage_cents": cs2_slip,
-                    "drop_warn_cents": cs2_drop_warn,
-                    "min_prob_pct": 0,
-                    "max_fav_prob": cs2_max_fav,
-                    "block_50_60": cs2_block_50_60,
-                    "detect_hedge": detect_hedge_global,
-                    "blocked_keywords": [k.strip().lower() for k in cs2_blocked_kw.split(",") if k.strip()],
-                    "required_market_substrings": [],
-                    "max_signal_age_mins": 0,
-                }
-            )
-        elif enable_cs2:
-            st.warning("Địa chỉ ví CS2 chưa đúng định dạng 42 ký tự 0x...")
-
-        if enable_dota and EVM_ADDR_RE.match(dota_wallet_raw):
-            active_profiles.append(
-                {
-                    "source_tag": "🐉 Dota 2",
-                    "wallet": dota_wallet_raw.lower(),
-                    "multiplier": dota_mult,
-                    "min_user_bet": dota_min_bet,
-                    "max_user_cap": dota_max_cap,
-                    "max_slippage_cents": dota_slip,
-                    "drop_warn_cents": 5.0,
-                    "min_prob_pct": dota_min_prob,
-                    "max_fav_prob": dota_max_fav,
-                    "block_50_60": dota_block_50_60,
-                    "detect_hedge": detect_hedge_global,
-                    "blocked_keywords": [k.strip().lower() for k in dota_blocked_kw.split(",") if k.strip()],
-                    "required_market_substrings": ["game 1 winner", "game 2 winner"] if dota_g12_only else [],
-                    "max_signal_age_mins": dota_age_warn,
-                }
-            )
-        elif enable_dota:
-            st.warning("Địa chỉ ví Dota 2 chưa đúng định dạng 42 ký tự 0x...")
-
-        if not active_profiles:
-            st.error("Chưa có ví hợp lệ nào được bật để quét.")
-        else:
+    if not EVM_ADDR_RE.match(cs2_wallet_raw):
+        st.error("Địa chỉ ví CS2 chưa đúng định dạng 42 ký tự 0x...")
+    else:
+        with st.spinner("Đang kéo dữ liệu Polymarket Data API v2, Gamma & Sổ lệnh CLOB..."):
+            cs2_cfg = {
+                "wallet": cs2_wallet_raw.lower(),
+                "multiplier": cs2_mult,
+                "min_user_bet": cs2_min_bet,
+                "max_user_cap": cs2_max_cap,
+                "max_slippage_cents": cs2_slip,
+                "drop_warn_cents": cs2_drop_warn,
+                "max_fav_prob": cs2_max_fav,
+                "block_50_60": cs2_block_50_60,
+                "detect_hedge": detect_hedge,
+                "blocked_keywords": [k.strip().lower() for k in cs2_blocked_kw.split(",") if k.strip()],
+            }
             try:
-                profiles_payload = []
-                for p_cfg in active_profiles:
-                    open_pos = fetch_positions_by_status(p_cfg["wallet"], "OPEN")
-                    redeem_pos = fetch_positions_by_status(p_cfg["wallet"], "REDEEMABLE")
-                    profiles_payload.append((p_cfg, open_pos, redeem_pos))
+                open_pos = fetch_positions_by_status(cs2_cfg["wallet"], "OPEN")
+                redeem_pos = fetch_positions_by_status(cs2_cfg["wallet"], "REDEEMABLE")
 
-                res = evaluate_all_profiles(profiles_payload)
-                res["resolved_info"] = {p["source_tag"]: p["wallet"] for p in active_profiles}
+                res = evaluate_cs2_positions(cs2_cfg, open_pos, redeem_pos)
+                res["wallet"] = cs2_cfg["wallet"]
                 st.session_state["scan_results"] = res
                 st.session_state["last_scan_time"] = datetime.now(VN_TZ).strftime("%H:%M:%S %d/%m/%Y (GMT+7)")
 
@@ -908,9 +742,9 @@ if scan_clicked or st.session_state["scan_results"] is None:
                 st.error(f"Lỗi kết nối Polymarket API: {exc}")
 
 if st.session_state["last_scan_time"]:
-    res_meta = (st.session_state["scan_results"] or {}).get("resolved_info", {})
-    wallets_badge = " | ".join(f"{tag}: `{addr[:8]}...{addr[-4:]}`" for tag, addr in res_meta.items())
-    col_time.info(f"🕒 Cập nhật: **{st.session_state['last_scan_time']}** • {wallets_badge}")
+    w_addr = (st.session_state["scan_results"] or {}).get("wallet", "")
+    w_badge = f" • Ví: `{w_addr[:8]}...{w_addr[-4:]}`" if w_addr else ""
+    col_time.info(f"🕒 Cập nhật: **{st.session_state['last_scan_time']}**{w_badge}")
 
 res = st.session_state["scan_results"]
 if res is not None:
@@ -947,14 +781,13 @@ if res is not None:
     # --- MỤC 1: KÈO HỢP LỆ ĐỂ VÀO LỆNH NGAY ---
     st.subheader(f"🟢 1. Kèo Hợp Lệ Để Vào Lệnh Ngay ({len(valid_df)})")
     if valid_df.empty:
-        st.info("Hiện chưa có kèo nào từ CS2 hoặc Dota 2 khớp đủ quy tắc và nằm trong ngưỡng trượt giá Ask.")
+        st.info("Hiện chưa có kèo CS2 nào khớp đủ quy tắc và nằm trong ngưỡng trượt giá Ask.")
     else:
         valid_df["entered"] = valid_df["pos_key"].isin(entered_set)
         disp_valid = valid_df[
             [
                 "pos_key",
                 "entered",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -979,7 +812,6 @@ if res is not None:
             hide_index=True,
             column_order=[
                 "entered",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -995,7 +827,6 @@ if res is not None:
             ],
             column_config={
                 "entered": st.column_config.CheckboxColumn("✅ Đã vào", default=False),
-                "source_tag": st.column_config.TextColumn("Nguồn Ví", width="small"),
                 "title": st.column_config.TextColumn("Trận đấu / Kèo", width="medium"),
                 "outcome": st.column_config.TextColumn("Cửa chọn", width="small"),
                 "final_user_bet": st.column_config.NumberColumn("Tiền bạn vào ($)", format="$%.2f"),
@@ -1011,7 +842,6 @@ if res is not None:
             },
             disabled=[
                 "pos_key",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -1043,7 +873,6 @@ if res is not None:
             [
                 "pos_key",
                 "entered",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -1067,7 +896,6 @@ if res is not None:
             hide_index=True,
             column_order=[
                 "entered",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -1082,7 +910,6 @@ if res is not None:
             ],
             column_config={
                 "entered": st.column_config.CheckboxColumn("✅ Đã kê Limit", default=False),
-                "source_tag": st.column_config.TextColumn("Nguồn Ví", width="small"),
                 "title": st.column_config.TextColumn("Trận đấu / Kèo", width="medium"),
                 "outcome": st.column_config.TextColumn("Cửa chọn", width="small"),
                 "final_user_bet": st.column_config.NumberColumn("Tiền bạn vào ($)", format="$%.2f"),
@@ -1097,7 +924,6 @@ if res is not None:
             },
             disabled=[
                 "pos_key",
-                "source_tag",
                 "title",
                 "outcome",
                 "final_user_bet",
@@ -1124,7 +950,7 @@ if res is not None:
     if not hedge_df.empty:
         st.subheader(f"🟠 3. Cảnh Báo Ví Gốc Đang Hedge 2 Đầu ({len(hedge_df)})")
         disp_hedge = hedge_df[
-            ["source_tag", "title", "outcome", "entry_cost_usdc", "raw_user_bet", "avg_price", "cur_price", "hedge_note", "url"]
+            ["title", "outcome", "entry_cost_usdc", "raw_user_bet", "avg_price", "cur_price", "hedge_note", "url"]
         ].copy()
         disp_hedge["avg_price"] = (disp_hedge["avg_price"] * 100.0).round(1)
         disp_hedge["cur_price"] = (disp_hedge["cur_price"] * 100.0).round(1)
@@ -1133,7 +959,6 @@ if res is not None:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "source_tag": "Nguồn Ví",
                 "title": "Trận đấu",
                 "outcome": "Cửa",
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
@@ -1150,7 +975,6 @@ if res is not None:
         st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải Chặn ({len(blocked_df)})")
         disp_blk = blocked_df[
             [
-                "source_tag",
                 "title",
                 "outcome",
                 "entry_cost_usdc",
@@ -1169,7 +993,6 @@ if res is not None:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "source_tag": "Nguồn Ví",
                 "title": "Trận đấu (Giải chặn)",
                 "outcome": "Cửa",
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
@@ -1186,7 +1009,7 @@ if res is not None:
     if not rejected_df.empty:
         with st.expander(f"⚪ 5. Xem Danh Sách Kèo Đã Loại Bỏ ({len(rejected_df)})", expanded=False):
             disp_rej = rejected_df[
-                ["source_tag", "title", "outcome", "entry_cost_usdc", "avg_price", "cur_price", "reject_reason"]
+                ["title", "outcome", "entry_cost_usdc", "avg_price", "cur_price", "reject_reason"]
             ].copy()
             disp_rej["avg_price"] = (disp_rej["avg_price"] * 100.0).round(1)
             disp_rej["cur_price"] = (disp_rej["cur_price"] * 100.0).round(1)
@@ -1195,7 +1018,6 @@ if res is not None:
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "source_tag": "Nguồn Ví",
                     "title": "Trận đấu",
                     "outcome": "Cửa",
                     "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
