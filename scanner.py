@@ -44,6 +44,8 @@ TEAM_ALIASES = {
     "g2.a": "g2 ares",
     "vit": "vitality",
     "prv": "parivision",
+    "pv": "parivision",
+    "pvision": "parivision",
     "fal": "team falcons",
     "tl": "liquid",
     "mglz": "themongolz",
@@ -64,6 +66,11 @@ TEAM_ALIASES = {
     "100t": "100 thieves",
     "gre": "grêmio esports",
     "tdp": "turma do pagode",
+    "fut": "fut esports",
+    "sin": "sinners",
+    "fly": "flyquest",
+    "jjh": "jijiehao",
+    "wc": "wildcard",
 }
 
 
@@ -314,10 +321,18 @@ def normalize_team_name(name: str) -> str:
 
 
 def extract_team_pair(title: str) -> frozenset[str] | None:
+    # Bước 1: Cắt tiền tố bộ môn (Counter-Strike / CS2) trước để xử lý được cả tiêu đề kép
     clean = re.sub(
-        r"^(Counter-Strike|CS2|Map\s*\d+\s*Rounds\s*Handicap|Map\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
+        r"^(Counter-Strike|CS2)\s*:\s*",
         "",
         title,
+        flags=re.IGNORECASE,
+    )
+    # Bước 2: Cắt tiếp tiền tố loại kèo phụ (Map Handicap, Map 1 Winner, Rounds Handicap, ...)
+    clean = re.sub(
+        r"^(Map\s*\d+\s*Rounds\s*Handicap|Map\s*\d+\s*Winner|Map\s*Handicap|Total\s*Maps|Match\s*Winner|Winner)\s*:\s*",
+        "",
+        clean,
         flags=re.IGNORECASE,
     )
     clean = re.sub(r"\([^)]*\)", "", clean)
@@ -371,6 +386,7 @@ def evaluate_cs2_positions(
     max_user_cap = float(cfg["max_user_cap"])
     max_slippage_cents = float(cfg["max_slippage_cents"])
     drop_warn_cents = float(cfg["drop_warn_cents"])
+    min_underdog_prob = int(cfg.get("min_underdog_prob", 30))
     max_fav_prob = int(cfg["max_fav_prob"])
     block_50_60 = bool(cfg["block_50_60"])
     detect_hedge = bool(cfg["detect_hedge"])
@@ -480,7 +496,7 @@ def evaluate_cs2_positions(
         if raw_bet < min_user_bet:
             continue
         avg_p = row["avg_price"]
-        if avg_p <= 0.0 or avg_p > (max_fav_prob / 100.0):
+        if avg_p <= 0.0 or avg_p < (min_underdog_prob / 100.0) or avg_p > (max_fav_prob / 100.0):
             continue
         if block_50_60 and (0.50 <= avg_p <= 0.60):
             continue
@@ -515,7 +531,9 @@ def evaluate_cs2_positions(
             cond_notes = []
             if raw_bet < min_user_bet:
                 cond_notes.append(f"< Min ${min_user_bet:.2f}")
-            if block_50_60 and (0.50 <= avg_p <= 0.60):
+            if avg_p < (min_underdog_prob / 100.0):
+                cond_notes.append(f"< {min_underdog_prob}%")
+            elif block_50_60 and (0.50 <= avg_p <= 0.60):
                 cond_notes.append("Dải 50-60%")
             elif avg_p > (max_fav_prob / 100.0):
                 cond_notes.append(f"> {max_fav_prob}%")
@@ -547,6 +565,10 @@ def evaluate_cs2_positions(
         # 5. Bộ lọc dải xác suất
         if avg_p <= 0.0:
             row["reject_reason"] = "Giá mua không hợp lệ (0¢)"
+            rejected_list.append(row)
+            continue
+        if avg_p < (min_underdog_prob / 100.0):
+            row["reject_reason"] = f"Under sâu < {min_underdog_prob}% ({avg_p * 100:.1f}¢)"
             rejected_list.append(row)
             continue
         if avg_p > (max_fav_prob / 100.0):
@@ -680,6 +702,7 @@ with st.sidebar:
 
     cs2_slip = st.slider("Trượt giá Ask tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_cs2")
     cs2_drop_warn = st.slider("Cảnh báo giá tụt sâu (¢)", 2.0, 15.0, 5.0, 1.0, key="drop_cs2")
+    cs2_min_prob = st.slider("Chặn kèo cửa dưới dưới (%)", 5, 45, 30, 5, key="min_prob_cs2")
     cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
     cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
     detect_hedge = st.checkbox("Chặn kèo ví gốc Hedge 2 đầu", value=True, key="hedge_cs2")
@@ -719,6 +742,7 @@ if scan_clicked or st.session_state["scan_results"] is None:
                 "max_user_cap": cs2_max_cap,
                 "max_slippage_cents": cs2_slip,
                 "drop_warn_cents": cs2_drop_warn,
+                "min_underdog_prob": cs2_min_prob,
                 "max_fav_prob": cs2_max_fav,
                 "block_50_60": cs2_block_50_60,
                 "detect_hedge": detect_hedge,
