@@ -125,18 +125,23 @@ def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = No
 
 
 # ======================== API FETCHERS (DATA API V2 CURSOR-ONLY) ========================
-def fetch_positions_by_status(wallet: str, status: str) -> list[dict]:
+def fetch_positions_by_status(
+    wallet: str,
+    status: str,
+    max_pages: int = 25,
+    page_limit: int = 500,
+) -> list[dict]:
     """Kéo vị thế theo chuẩn Polymarket Data API v2 (Cursor-only, không dùng offset)."""
     results: list[dict] = []
     w_clean = wallet.lower().strip()
     params: dict = {
         "user": w_clean,
         "status": status,
-        "limit": 500,
+        "limit": page_limit,
     }
     seen_cursors: set[str] = set()
 
-    for _ in range(25):
+    for _ in range(max_pages):
         resp = requests.get(f"{DATA_API_BASE}/v2/positions", params=params, timeout=15)
         if resp.status_code == 429:
             time.sleep(1.5)
@@ -167,88 +172,27 @@ def fetch_positions_by_status(wallet: str, status: str) -> list[dict]:
     return results
 
 
-def fetch_wallet_activity_accum(
-    wallet: str,
-    target_cids: set[str],
-    max_pages: int = 4,
-) -> dict[str, dict]:
-    """
-    Kéo lịch sử /v2/activity (cursor-only) để đo thời gian gom lệnh (accum_hours)
-    cho các condition_id đạt điều kiện copy, phát hiện kèo gom kéo dài xuyên sang Live.
-    """
-    if not target_cids:
-        return {}
+def _extract_gamma_market_meta(m: dict) -> dict:
+    events = m.get("events") or []
+    ev_title = ""
+    ev_slug = ""
+    ev_start = None
+    if isinstance(events, list) and events:
+        ev_title = str(events[0].get("title") or "").strip()
+        ev_slug = str(events[0].get("slug") or "").strip()
+        ev_start = events[0].get("startTime") or events[0].get("gameStartTime")
+    if not ev_title:
+        ev_title = str(m.get("question") or "").strip()
+    if not ev_slug:
+        ev_slug = str(m.get("slug") or "").strip()
 
-    w_clean = wallet.lower().strip()
-    params: dict = {"user": w_clean, "limit": 500}
-    seen_cursors: set[str] = set()
-    ts_by_key: dict[str, list[float]] = {}
-
-    for _ in range(max_pages):
-        try:
-            resp = requests.get(f"{DATA_API_BASE}/v2/activity", params=params, timeout=12)
-            if resp.status_code == 429:
-                time.sleep(1.2)
-                continue
-            if not resp.ok:
-                break
-            payload = resp.json()
-        except Exception:
-            break
-
-        batch = payload.get("data") if isinstance(payload, dict) else payload
-        if not batch or not isinstance(batch, list):
-            break
-
-        for item in batch:
-            cid = str(
-                item.get("condition_id")
-                or item.get("conditionId")
-                or item.get("market")
-                or ""
-            ).strip()
-            if not cid or cid not in target_cids:
-                continue
-
-            act_type = str(item.get("type") or item.get("action") or "").upper()
-            side = str(item.get("side") or "").upper()
-            if act_type in ("REDEEM", "MERGE", "SPLIT") or side == "SELL":
-                continue
-
-            ts = to_epoch_seconds(
-                item.get("timestamp")
-                or item.get("created_at")
-                or item.get("time")
-            )
-            if ts is None:
-                continue
-
-            tid = str(item.get("token_id") or item.get("asset") or "").strip()
-            if tid:
-                ts_by_key.setdefault(f"{cid}_{tid}", []).append(ts)
-            ts_by_key.setdefault(cid, []).append(ts)
-
-        if not isinstance(payload, dict):
-            break
-        pagination = payload.get("pagination") or {}
-        next_cursor = pagination.get("next_cursor") or payload.get("next_cursor")
-        has_more = pagination.get("has_more", bool(next_cursor))
-        if not next_cursor or not has_more or next_cursor in seen_cursors:
-            break
-        seen_cursors.add(next_cursor)
-        params = {"user": w_clean, "cursor": next_cursor}
-
-    accum_map: dict[str, dict] = {}
-    for k, ts_list in ts_by_key.items():
-        if ts_list:
-            span_h = max(0.0, (max(ts_list) - min(ts_list)) / 3600.0)
-            accum_map[k] = {
-                "accum_hours": round(span_h, 2),
-                "buy_clips": len(ts_list),
-                "first_buy_ts": min(ts_list),
-                "last_buy_ts": max(ts_list),
-            }
-    return accum_map
+    game_start = m.get("gameStartTime") or m.get("eventStartTime") or ev_start
+    return {
+        "event_title": ev_title,
+        "event_slug": ev_slug,
+        "question": str(m.get("question") or "").strip(),
+        "game_start_time": game_start,
+    }
 
 
 def fetch_gamma_events_meta(
@@ -270,23 +214,8 @@ def fetch_gamma_events_meta(
                 if isinstance(markets, list):
                     for m in markets:
                         cid = str(m.get("conditionId") or m.get("condition_id") or "").strip()
-                        events = m.get("events") or []
-                        ev_title = ""
-                        ev_slug = ""
-                        if isinstance(events, list) and events:
-                            ev_title = str(events[0].get("title") or "").strip()
-                            ev_slug = str(events[0].get("slug") or "").strip()
-                        if not ev_title:
-                            ev_title = str(m.get("question") or "").strip()
-                        if not ev_slug:
-                            ev_slug = str(m.get("slug") or "").strip()
-
-                        if cid and (ev_title or ev_slug):
-                            cache[cid] = {
-                                "event_title": ev_title,
-                                "event_slug": ev_slug,
-                                "question": str(m.get("question") or "").strip(),
-                            }
+                        if cid:
+                            cache[cid] = _extract_gamma_market_meta(m)
         except Exception:
             pass
 
@@ -321,19 +250,8 @@ def fetch_gamma_events_meta(
                                 if str(t) in token_to_cid:
                                     cid = token_to_cid[str(t)]
                                     break
-                        events = m.get("events") or []
-                        ev_title = str(events[0].get("title") or "").strip() if events else ""
-                        ev_slug = str(events[0].get("slug") or "").strip() if events else ""
-                        if not ev_title:
-                            ev_title = str(m.get("question") or "").strip()
-                        if not ev_slug:
-                            ev_slug = str(m.get("slug") or "").strip()
-                        if cid and (ev_title or ev_slug):
-                            cache[cid] = {
-                                "event_title": ev_title,
-                                "event_slug": ev_slug,
-                                "question": str(m.get("question") or "").strip(),
-                            }
+                        if cid:
+                            cache[cid] = _extract_gamma_market_meta(m)
         except Exception:
             pass
 
@@ -386,7 +304,8 @@ def to_epoch_seconds(raw_ts) -> float | None:
             if ts > 1e12:
                 ts /= 1000.0
             return ts if ts > 0 else None
-        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        s_norm = re.sub(r"([+-]\d{2})$", r"\1:00", s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s_norm)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
@@ -415,6 +334,27 @@ def parse_time_info(raw_ts) -> str:
         return f"{days}d {hours % 24}h trước"
     except Exception:
         return "—"
+
+
+def format_start_countdown(start_ts: float | None, now_ts: float) -> tuple[bool, float | None, str]:
+    """Trả về (is_live, secs_to_start, display_str)."""
+    if start_ts is None:
+        return False, None, "—"
+    secs = start_ts - now_ts
+    if secs <= 0:
+        mins_ago = int(abs(secs) // 60)
+        if mins_ago < 60:
+            return True, secs, f"🔴 LIVE ({mins_ago}p)"
+        return True, secs, f"🔴 LIVE ({mins_ago // 60}h{mins_ago % 60:02d}p)"
+    mins = int(secs // 60)
+    if mins < 60:
+        return False, secs, f"⏳ {mins}p nữa"
+    hours = mins // 60
+    rem_mins = mins % 60
+    if hours < 24:
+        return False, secs, f"⏳ {hours}h{rem_mins:02d}p"
+    days = hours // 24
+    return False, secs, f"⏳ {days}d {hours % 24}h"
 
 
 def calc_taker_breakeven_price(avg_p: float) -> float:
@@ -458,12 +398,13 @@ def extract_team_pair(title: str) -> frozenset[str] | None:
     return None
 
 
-def matches_blocked_league(
+def matches_blocked_rule(
     combined_text: str,
     blocked_keywords: list[str],
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
+    """Trả về (is_blocked, reason, is_league_block)."""
     if not blocked_keywords:
-        return False, ""
+        return False, "", False
     txt = combined_text.lower()
     is_cct_sa = "cct south america" in txt or "cct sa" in txt
 
@@ -474,10 +415,16 @@ def matches_blocked_league(
                 or re.search(r"\bcct[\s\-_]*eu\b", txt)
                 or "cct europe" in txt
             ):
-                return True, "CCT Europe"
+                return True, "CCT Europe", True
+        elif kw in ("bo1", "(bo1)"):
+            if re.search(r"\(\s*bo1\s*\)|\bbo1\b", txt):
+                return True, "Chặn BO1", False
+        elif kw in ("bo5", "(bo5)"):
+            if re.search(r"\(\s*bo5\s*\)|\bbo5\b", txt):
+                return True, "Chặn BO5", False
         elif kw and kw in txt:
-            return True, kw
-    return False, ""
+            return True, kw, True
+    return False, "", False
 
 
 def evaluate_cs2_positions(
@@ -502,9 +449,9 @@ def evaluate_cs2_positions(
     max_fav_prob = int(cfg["max_fav_prob"])
     block_50_60 = bool(cfg["block_50_60"])
     detect_hedge = bool(cfg["detect_hedge"])
-    check_accum_live = bool(cfg.get("check_accum_live", True))
-    max_accum_hours = float(cfg.get("max_accum_hours", 2.0))
+    block_live = bool(cfg.get("block_live", True))
     blocked_keywords = cfg["blocked_keywords"]
+    now_ts = datetime.now(timezone.utc).timestamp()
 
     parsed_rows: list[dict] = []
     blocked_team_pairs: set[frozenset[str]] = set()
@@ -528,6 +475,9 @@ def evaluate_cs2_positions(
         if not slug and ev_slug:
             slug = ev_slug
         gamma_unverified = not bool(ev_title or ev_slug)
+
+        start_ts = to_epoch_seconds(meta.get("game_start_time"))
+        is_live, secs_to_start, start_countdown = format_start_countdown(start_ts, now_ts)
 
         avg_p = safe_float(p.get("avg_price") or p.get("avgPrice"), 0.0)
         cur_p = safe_float(p.get("current_price") or p.get("curPrice"), 0.0)
@@ -559,9 +509,9 @@ def evaluate_cs2_positions(
         url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
         combined_text = f"{title} | {ev_title} | {slug} | {ev_slug}"
-        is_blk, blk_reason = matches_blocked_league(combined_text, blocked_keywords)
+        is_blk, blk_reason, is_league_blk = matches_blocked_rule(combined_text, blocked_keywords)
         team_pair = extract_team_pair(title)
-        if is_blk and team_pair:
+        if is_blk and is_league_blk and team_pair:
             blocked_team_pairs.add(team_pair)
 
         parsed_rows.append(
@@ -579,6 +529,9 @@ def evaluate_cs2_positions(
                 "entry_cost_usdc": entry_cost,
                 "total_pnl": total_pnl,
                 "last_buy_ago": last_ago_str,
+                "is_live": is_live,
+                "secs_to_start": secs_to_start,
+                "start_countdown": start_countdown,
                 "gamma_unverified": gamma_unverified,
                 "is_blocked_direct": is_blk,
                 "blocked_reason": blk_reason,
@@ -586,21 +539,20 @@ def evaluate_cs2_positions(
             }
         )
 
-    # Khóa chéo các kèo phụ (Map 1/2, Handicap, Total Maps...) cùng cặp đội thuộc giải chặn
+    # Khóa chéo các kèo phụ (Map 1/2, Handicap...) cùng cặp đội thuộc giải chặn (vd: CCT Europe)
     for row in parsed_rows:
         if not row["is_blocked_direct"] and row["team_pair"] and row["team_pair"] in blocked_team_pairs:
             row["is_blocked_direct"] = True
             row["blocked_reason"] = "Khóa chéo cặp đội giải chặn"
 
-    # Đếm số cửa đang mở trên cùng condition_id (không tính giải chặn)
+    # Đếm số cửa đang mở trên cùng condition_id
     cid_outcomes: dict[str, set[str]] = {}
     for row in parsed_rows:
         if not row["is_blocked_direct"]:
             cid_outcomes.setdefault(row["condition_id"], set()).add(row["outcome"])
 
-    # Gom danh sách token/condition đạt toàn bộ quy tắc để kéo CLOB & Activity 1 lần duy nhất
+    # Gom danh sách token đạt toàn bộ quy tắc để kéo CLOB /books 1 lần duy nhất
     candidate_tids: list[str] = []
-    candidate_cids: set[str] = set()
     for row in parsed_rows:
         row["cid_outcome_cnt"] = len(cid_outcomes.get(row["condition_id"], set()))
         if row["is_blocked_direct"]:
@@ -608,6 +560,8 @@ def evaluate_cs2_positions(
         if detect_hedge and row["cid_outcome_cnt"] >= 2:
             continue
         if not (0.02 < row["cur_price"] < 0.98):
+            continue
+        if block_live and row["is_live"]:
             continue
         raw_bet = row["entry_cost_usdc"] * multiplier
         if raw_bet < min_user_bet:
@@ -618,15 +572,8 @@ def evaluate_cs2_positions(
         if block_50_60 and (0.50 <= avg_p <= 0.60):
             continue
         candidate_tids.append(row["token_id"])
-        if row["condition_id"]:
-            candidate_cids.add(row["condition_id"])
 
     books_map = fetch_clob_books(candidate_tids)
-    accum_map = (
-        fetch_wallet_activity_accum(wallet, candidate_cids, max_pages=4)
-        if (check_accum_live and candidate_cids)
-        else {}
-    )
 
     valid_list: list[dict] = []
     slip_list: list[dict] = []
@@ -643,7 +590,7 @@ def evaluate_cs2_positions(
         final_bet = round(min(raw_bet, max_user_cap), 2)
         is_settled = cur_p >= 0.98 or cur_p <= 0.02
 
-        # 1. Giải chặn (CCT Europe + Khóa chéo) — Ưu tiên trước để không sót khi trận vừa ngã ngũ
+        # 1. Giải / Thể thức chặn (CCT Europe, BO1, BO5 + Khóa chéo giải đấu)
         if row["is_blocked_direct"]:
             cond_notes = []
             if is_settled:
@@ -676,7 +623,7 @@ def evaluate_cs2_positions(
             hedge_list.append(row)
             continue
 
-        # 3. Vị thế đã ngã ngũ (0¢ hoặc 100¢) chờ Redeem
+        # 3. Vị thế đã ngã ngũ (0¢ hoặc 100¢)
         if is_settled:
             if cur_p <= 0.02:
                 dead_zero_count += 1
@@ -684,7 +631,13 @@ def evaluate_cs2_positions(
             rejected_list.append(row)
             continue
 
-        # 4. Ngưỡng vốn tối thiểu (>= $2,000 ví gốc)
+        # 4. Chặn trận đã Live (qua gameStartTime)
+        if block_live and row["is_live"]:
+            row["reject_reason"] = f"Đã qua giờ bắt đầu ({row['start_countdown']})"
+            rejected_list.append(row)
+            continue
+
+        # 5. Ngưỡng vốn tối thiểu
         if raw_bet < min_user_bet:
             min_whale_req = min_user_bet / multiplier if multiplier > 0 else 0
             row["reject_reason"] = (
@@ -693,7 +646,7 @@ def evaluate_cs2_positions(
             rejected_list.append(row)
             continue
 
-        # 5. Bộ lọc dải xác suất chống overfit (15%–50% & 60%–85%)
+        # 6. Bộ lọc dải xác suất
         if avg_p <= 0.0:
             row["reject_reason"] = "Giá mua không hợp lệ (0¢)"
             rejected_list.append(row)
@@ -711,7 +664,7 @@ def evaluate_cs2_positions(
             rejected_list.append(row)
             continue
 
-        # 6. Đánh giá sổ lệnh CLOB, Hòa vốn Taker & Thời gian gom lệnh
+        # 7. Đánh giá sổ lệnh CLOB, Hòa vốn Taker & Giá kê Limit tối ưu
         max_limit_price = min(avg_p + (max_slippage_cents / 100.0), 0.99)
         max_limit_cents = round(max_limit_price * 100.0, 1)
 
@@ -719,6 +672,10 @@ def evaluate_cs2_positions(
         taker_be_cents = round(taker_be_price * 100.0, 1)
 
         book = books_map.get(row["token_id"], {})
+        tick_size = safe_float(book.get("tick_size"), 0.01)
+        if tick_size <= 0.0 or tick_size > 0.05:
+            tick_size = 0.01
+
         asks_raw = book.get("asks") or []
         parsed_asks: list[tuple[float, float]] = []
         for a in asks_raw:
@@ -730,13 +687,9 @@ def evaluate_cs2_positions(
 
         notes: list[str] = []
         if row["gamma_unverified"]:
-            notes.append("⚠️ Chưa xác minh giải (Gamma)")
-
-        # Cảnh báo thời gian gom lệnh kéo dài (> 2h) từ /v2/activity
-        acc_info = accum_map.get(f"{row['condition_id']}_{row['token_id']}") or accum_map.get(row["condition_id"])
-        accum_h = acc_info["accum_hours"] if acc_info else 0.0
-        if check_accum_live and accum_h > max_accum_hours:
-            notes.append(f"⚠️ Gom {accum_h:.1f}h (>{max_accum_hours:.1f}h — CHECK LIVE!)")
+            notes.append("⚠️ Chưa xác minh Gamma")
+        if row["secs_to_start"] is not None and 0 < row["secs_to_start"] <= 1800:
+            notes.append("⏰ Sắp bắn (<30p)")
 
         if parsed_asks:
             best_ask = parsed_asks[0][0]
@@ -749,50 +702,50 @@ def evaluate_cs2_positions(
             avail_liq_usdc = 0.0
             exec_price = cur_p if (0.02 < cur_p < 0.98) else avg_p
             is_empty_ask = True
-            notes.append("📋 Trống Ask (Kê Limit)")
 
         slippage_cents = round((exec_price - avg_p) * 100.0, 1)
         drop_cents = round((avg_p - exec_price) * 100.0, 1)
+        is_slippage_over = (not is_empty_ask) and (slippage_cents > max_slippage_cents)
+
+        # Tính giá kê Limit Maker tối ưu (đứng dưới Best Ask 1 tick để 0% phí, không vượt trần Maker)
+        if not is_empty_ask and not is_slippage_over:
+            rec_limit_price = max(0.01, min(round(exec_price - tick_size, 4), max_limit_price))
+        else:
+            rec_limit_price = max_limit_price
+        rec_limit_cents = round(rec_limit_price * 100.0, 1)
+
+        # Gắn nhãn 3 chế độ khớp lệnh
+        if is_empty_ask:
+            notes.insert(0, f"📋 TRỐNG ASK (Kê {rec_limit_cents:.1f}¢)")
+        elif is_slippage_over:
+            notes.insert(0, f"🟡 KÊ LIMIT CHỜ ({rec_limit_cents:.1f}¢)")
+        elif exec_price <= taker_be_price + 1e-6:
+            notes.insert(0, "⚡ TAKER OK")
+        else:
+            notes.insert(0, f"🎯 KÊ LIMIT ({rec_limit_cents:.1f}¢)")
 
         if drop_cents > drop_warn_cents:
-            notes.append(f"⚠️ Tụt >{drop_warn_cents:.0f}¢ — CHECK LIVE!")
+            notes.append(f"⚠️ Tụt >{drop_warn_cents:.0f}¢")
 
-        # Kỷ luật riêng cho dải cửa dưới 15%–30%
-        if avg_p < 0.30:
-            if not is_empty_ask and slippage_cents > 1.5:
-                notes.append("🎯 Under <30%: Chỉ kê Limit <=+1.5¢")
-            else:
-                notes.append("🎯 Under <30% (Ưu tiên Limit)")
+        if avg_p < 0.30 and not is_empty_ask and slippage_cents > 1.5:
+            notes.append("Under <30%: Kê <=+1.5¢")
 
-        is_slippage_over = slippage_cents > max_slippage_cents
-        if not is_empty_ask and not is_slippage_over:
-            if exec_price > taker_be_price + 1e-6:
-                notes.append(f"📋 Kê Limit (Ask > HV Taker {taker_be_cents:.1f}¢)")
-            if avail_liq_usdc < final_bet:
-                notes.append(f"💧 Ask mỏng (${avail_liq_usdc:.2f})")
+        if not is_empty_ask and not is_slippage_over and avail_liq_usdc < final_bet:
+            notes.append(f"💧 Ask mỏng (${avail_liq_usdc:.2f})")
 
-        ref_limit_price = max(max_limit_price, 0.01)
-        est_shares = final_bet / ref_limit_price
-        needs_limit = (
-            is_empty_ask
-            or is_slippage_over
-            or (avail_liq_usdc < final_bet)
-            or (exec_price > taker_be_price + 1e-6)
-        )
+        est_shares = final_bet / max(rec_limit_price, 0.01)
+        needs_limit = is_empty_ask or is_slippage_over or (exec_price > taker_be_price + 1e-6)
         if needs_limit and est_shares < 5.0:
-            min_limit_usdc = 5.0 * ref_limit_price
+            min_limit_usdc = 5.0 * max(rec_limit_price, 0.01)
             notes.append(f"⚠️ Limit cần >=5sh (~${min_limit_usdc:.2f})")
-
-        if not notes:
-            notes.append("✅ Khớp đẹp (Đạt cả Taker)")
 
         row["final_user_bet"] = final_bet
         row["exec_price"] = exec_price
         row["slippage_cents"] = slippage_cents
         row["taker_be_cents"] = taker_be_cents
+        row["rec_limit_cents"] = rec_limit_cents
         row["max_limit_cents"] = max_limit_cents
         row["avail_liq_usdc"] = round(avail_liq_usdc, 2)
-        row["accum_hours"] = accum_h
         row["action_note"] = " | ".join(notes)
 
         if is_slippage_over:
@@ -866,18 +819,22 @@ with st.sidebar:
         15,
         5,
         key="min_prob_cs2",
-        help="Chuẩn backtest chống overfit: 15% (giữ dải 15–30% có lãi ròng, ưu tiên kê Limit).",
+        help="Chuẩn backtest: 15% (giữ dải 15–50% có kỳ vọng dương mạnh trên ví Whale).",
     )
     cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
     cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
     detect_hedge = st.checkbox("Chặn kèo ví gốc Hedge 2 đầu", value=True, key="hedge_cs2")
-    check_accum_live = st.checkbox(
-        "Cảnh báo ví gốc gom > 2.0h (Check Live)",
+    block_live = st.checkbox(
+        "Chặn kèo đã Live (qua gameStartTime)",
         value=True,
-        key="accum_cs2",
-        help="Kéo /v2/activity để cảnh báo nếu ví gốc gom rải rác quá 2 giờ (dễ dính lệnh Live).",
+        key="live_cs2",
+        help="Lấy giờ bắt đầu thực tế từ Gamma API để loại kèo đã vào trận.",
     )
-    cs2_blocked_kw = st.text_input("Giải chặn (cách nhau dấu phẩy)", value="CCT Europe", key="blk_cs2")
+    cs2_blocked_kw = st.text_input(
+        "Giải / thể thức chặn (cách nhau dấu phẩy)",
+        value="CCT Europe, BO1, BO5",
+        key="blk_cs2",
+    )
 
     cs2_min_whale = cs2_min_bet / cs2_mult if cs2_mult > 0 else 0
     cs2_max_whale = cs2_max_cap / cs2_mult if cs2_mult > 0 else 0
@@ -917,13 +874,12 @@ if scan_clicked or st.session_state["scan_results"] is None:
                 "max_fav_prob": cs2_max_fav,
                 "block_50_60": cs2_block_50_60,
                 "detect_hedge": detect_hedge,
-                "check_accum_live": check_accum_live,
-                "max_accum_hours": 2.0,
+                "block_live": block_live,
                 "blocked_keywords": [k.strip().lower() for k in cs2_blocked_kw.split(",") if k.strip()],
             }
             try:
-                open_pos = fetch_positions_by_status(cs2_cfg["wallet"], "OPEN")
-                redeem_pos = fetch_positions_by_status(cs2_cfg["wallet"], "REDEEMABLE")
+                open_pos = fetch_positions_by_status(cs2_cfg["wallet"], "OPEN", max_pages=25, page_limit=500)
+                redeem_pos = fetch_positions_by_status(cs2_cfg["wallet"], "REDEEMABLE", max_pages=1, page_limit=100)
 
                 res = evaluate_cs2_positions(cs2_cfg, open_pos, redeem_pos)
                 res["wallet"] = cs2_cfg["wallet"]
@@ -970,7 +926,7 @@ if res is not None:
     m1.metric("🟢 Kèo hợp lệ ngay", len(valid_df))
     m2.metric("💰 Vốn cần thêm ($)", f"${remaining_capital:.2f}")
     m3.metric("🟡 Quá trượt giá (Limit)", len(slip_df))
-    m4.metric("🚫 Giải chặn", len(blocked_df))
+    m4.metric("🚫 Giải / Thể thức chặn", len(blocked_df))
     m5.metric("🏆 Chờ Redeem / Xác 0¢", f"{redeem_cnt} / {dead_zero_cnt}")
 
     st.divider()
@@ -993,9 +949,11 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "avail_liq_usdc",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ]
@@ -1018,9 +976,11 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "avail_liq_usdc",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ],
@@ -1029,22 +989,28 @@ if res is not None:
                 "title": st.column_config.TextColumn("Trận đấu / Kèo", width="medium"),
                 "outcome": st.column_config.TextColumn("Cửa chọn", width="small"),
                 "final_user_bet": st.column_config.NumberColumn("Tiền bạn vào ($)", format="$%.2f"),
-                "action_note": st.column_config.TextColumn("Trạng thái sổ lệnh", width="medium"),
+                "action_note": st.column_config.TextColumn("Chế độ khớp lệnh", width="medium"),
                 "avg_price": st.column_config.NumberColumn("Giá ví gốc (¢)", format="%.1f¢"),
                 "exec_price": st.column_config.NumberColumn("Best Ask (¢)", format="%.1f¢"),
                 "slippage_cents": st.column_config.NumberColumn("Trượt giá (¢)", format="%+.1f¢"),
                 "taker_be_cents": st.column_config.NumberColumn(
-                    "🎯 Hòa vốn Taker (¢)",
+                    "⚡ Hòa vốn Taker (¢)",
                     format="%.1f¢",
                     help="Best Ask <= mức này mới nên bấm mua ngay (đã trừ phí Sports 5%).",
+                ),
+                "rec_limit_cents": st.column_config.NumberColumn(
+                    "🎯 Giá kê Limit (¢)",
+                    format="%.1f¢",
+                    help="Giá Bid tối ưu để đứng đầu sổ lệnh Maker (0% phí) mà không khớp Taker.",
                 ),
                 "max_limit_cents": st.column_config.NumberColumn(
                     "🛑 Trần Maker (¢)",
                     format="%.1f¢",
-                    help="Giá tối đa để kê lệnh Limit Maker (0% phí).",
+                    help="Giá tối đa cho phép kê lệnh Limit Maker.",
                 ),
                 "avail_liq_usdc": st.column_config.NumberColumn("Thanh khoản Ask ($)", format="$%.2f"),
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
+                "start_countdown": st.column_config.TextColumn("Giờ bắn", width="small"),
                 "last_buy_ago": st.column_config.TextColumn("Cập nhật", width="small"),
                 "url": st.column_config.LinkColumn("Polymarket", display_text="Mở kèo ↗"),
             },
@@ -1058,9 +1024,11 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "avail_liq_usdc",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ],
@@ -1090,8 +1058,10 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ]
@@ -1114,8 +1084,10 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ],
@@ -1128,9 +1100,11 @@ if res is not None:
                 "avg_price": st.column_config.NumberColumn("Giá ví gốc (¢)", format="%.1f¢"),
                 "exec_price": st.column_config.NumberColumn("Best Ask (¢)", format="%.1f¢"),
                 "slippage_cents": st.column_config.NumberColumn("Trượt giá (¢)", format="%+.1f¢"),
-                "taker_be_cents": st.column_config.NumberColumn("🎯 Hòa vốn Taker (¢)", format="%.1f¢"),
+                "taker_be_cents": st.column_config.NumberColumn("⚡ Hòa vốn Taker (¢)", format="%.1f¢"),
+                "rec_limit_cents": st.column_config.NumberColumn("🎯 Giá kê Limit (¢)", format="%.1f¢"),
                 "max_limit_cents": st.column_config.NumberColumn("🛑 Trần Maker (¢)", format="%.1f¢"),
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
+                "start_countdown": st.column_config.TextColumn("Giờ bắn", width="small"),
                 "last_buy_ago": st.column_config.TextColumn("Cập nhật", width="small"),
                 "url": st.column_config.LinkColumn("Polymarket", display_text="Mở kèo ↗"),
             },
@@ -1144,8 +1118,10 @@ if res is not None:
                 "exec_price",
                 "slippage_cents",
                 "taker_be_cents",
+                "rec_limit_cents",
                 "max_limit_cents",
                 "entry_cost_usdc",
+                "start_countdown",
                 "last_buy_ago",
                 "url",
             ],
@@ -1183,9 +1159,9 @@ if res is not None:
             },
         )
 
-    # --- MỤC 4: BẢNG THEO DÕI RIÊNG GIẢI CHẶN ---
+    # --- MỤC 4: BẢNG THEO DÕI RIÊNG GIẢI / THỂ THỨC CHẶN ---
     if not blocked_df.empty:
-        st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải Chặn ({len(blocked_df)})")
+        st.subheader(f"🚫 4. Bảng Theo Dõi Riêng: Giải / Thể Thức Chặn ({len(blocked_df)})")
         disp_blk = blocked_df[
             [
                 "title",
@@ -1206,7 +1182,7 @@ if res is not None:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "title": "Trận đấu (Giải chặn)",
+                "title": "Trận đấu (Chặn)",
                 "outcome": "Cửa",
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
                 "raw_user_bet": st.column_config.NumberColumn("Quy đổi ($)", format="$%.2f"),
