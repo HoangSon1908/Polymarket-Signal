@@ -75,19 +75,30 @@ TEAM_ALIASES = {
 }
 
 
-# ======================== PERSISTENCE HELPERS ========================
+# ======================== PERSISTENCE HELPERS (SCALE-IN READY) ========================
 def short_hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
-def load_persisted_ids(active_keys: set[str] | None = None) -> set[str]:
-    saved: set[str] = set()
+def load_persisted_amounts(active_keys: set[str] | None = None) -> dict[str, float]:
+    """
+    Trả về dict {pos_key: entered_usdc}.
+    Giá trị -1.0 biểu thị dữ liệu legacy (đã vào trước khi nâng cấp Scale-In, sẽ tự đồng bộ bằng target_bet).
+    """
+    saved: dict[str, float] = {}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list):
-                    saved.update(str(x) for x in data)
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        try:
+                            saved[str(k)] = float(v)
+                        except Exception:
+                            saved[str(k)] = -1.0
+                elif isinstance(data, list):
+                    for x in data:
+                        saved[str(x)] = -1.0
         except Exception:
             pass
 
@@ -95,26 +106,51 @@ def load_persisted_ids(active_keys: set[str] | None = None) -> set[str]:
     if isinstance(qp_raw, list):
         qp_raw = ",".join(qp_raw)
     if qp_raw and active_keys:
-        hashes = {h.strip() for h in str(qp_raw).split(",") if h.strip()}
+        hash_to_amt: dict[str, float] = {}
+        for item in str(qp_raw).split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                h_part, a_part = item.split(":", 1)
+                try:
+                    hash_to_amt[h_part.strip()] = float(a_part)
+                except Exception:
+                    hash_to_amt[h_part.strip()] = -1.0
+            else:
+                hash_to_amt[item] = -1.0
+
         for k in active_keys:
-            if short_hash(k) in hashes:
-                saved.add(k)
+            h = short_hash(k)
+            if h in hash_to_amt and k not in saved:
+                saved[k] = hash_to_amt[h]
     return saved
 
 
-def persist_entered_ids(entered_ids: set[str], active_keys: set[str] | None = None) -> None:
+def persist_entered_amounts(
+    entered_amounts: dict[str, float],
+    active_keys: set[str] | None = None,
+) -> None:
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(entered_ids), f, ensure_ascii=False, indent=2)
+            json.dump(dict(sorted(entered_amounts.items())), f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
     try:
-        if entered_ids:
-            target_keys = (entered_ids & active_keys) if active_keys else entered_ids
-            hashes = sorted({short_hash(k) for k in target_keys})
-            if hashes:
-                st.query_params["entered"] = ",".join(hashes)
+        if entered_amounts:
+            target_keys = (
+                (set(entered_amounts.keys()) & active_keys)
+                if active_keys
+                else set(entered_amounts.keys())
+            )
+            tokens = sorted(
+                f"{short_hash(k)}:{entered_amounts[k]:.2f}"
+                for k in target_keys
+                if entered_amounts.get(k, 0.0) != 0.0
+            )
+            if tokens:
+                st.query_params["entered"] = ",".join(tokens)
             elif "entered" in st.query_params:
                 del st.query_params["entered"]
         else:
@@ -313,27 +349,28 @@ def to_epoch_seconds(raw_ts) -> float | None:
         return None
 
 
-def parse_time_info(raw_ts) -> str:
+def parse_time_info(raw_ts, now_ts: float | None = None) -> tuple[str, float | None]:
+    """Trả về (chuỗi hiển thị thời gian, tuổi tín hiệu tính bằng giờ)."""
     ts = to_epoch_seconds(raw_ts)
     if ts is None:
-        return "—"
+        return "—", None
     try:
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-        diff = datetime.now(timezone.utc) - dt
-        age_mins = max(0.0, diff.total_seconds() / 60.0)
-        mins = int(age_mins)
+        ref_now = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
+        diff_secs = max(0.0, ref_now - ts)
+        age_hours = diff_secs / 3600.0
+        mins = int(diff_secs // 60)
         if mins < 1:
-            return "Vừa xong ⚡"
+            return "Vừa xong ⚡", age_hours
         if mins < 60:
-            return f"{mins}p trước"
+            return f"{mins}p trước", age_hours
         hours = mins // 60
         rem_mins = mins % 60
         if hours < 24:
-            return f"{hours}h{rem_mins:02d}p trước"
+            return f"{hours}h{rem_mins:02d}p trước", age_hours
         days = hours // 24
-        return f"{days}d {hours % 24}h trước"
+        return f"{days}d {hours % 24}h trước", age_hours
     except Exception:
-        return "—"
+        return "—", None
 
 
 def format_start_countdown(start_ts: float | None, now_ts: float) -> tuple[bool, float | None, str]:
@@ -367,6 +404,18 @@ def calc_taker_breakeven_price(avg_p: float) -> float:
     disc = max(0.0, 110.25 - 20.0 * avg_p)
     p_be = 10.5 - math.sqrt(disc)
     return max(0.01, min(p_be, 0.99))
+
+
+def calc_dynamic_max_slip(base_slip_cents: float, avg_p: float) -> float:
+    """
+    Odds-Adjusted Slippage:
+    Giữ nguyên trần trượt giá ở vùng cửa dưới/cân bằng, tự siết chặt ở vùng cửa trên
+    để không mất quá >12% biên lợi nhuận kỳ vọng (1 - P_whale).
+    """
+    if avg_p <= 0.0 or avg_p >= 1.0:
+        return base_slip_cents
+    odds_cap = round(12.0 * (1.0 - avg_p), 1)
+    return min(base_slip_cents, max(0.5, odds_cap))
 
 
 def normalize_team_name(name: str) -> str:
@@ -445,11 +494,12 @@ def evaluate_cs2_positions(
     max_user_cap = float(cfg["max_user_cap"])
     max_slippage_cents = float(cfg["max_slippage_cents"])
     drop_warn_cents = float(cfg["drop_warn_cents"])
-    min_underdog_prob = int(cfg.get("min_underdog_prob", 15))
+    min_underdog_prob = int(cfg.get("min_underdog_prob", 35))
     max_fav_prob = int(cfg["max_fav_prob"])
     block_50_60 = bool(cfg["block_50_60"])
     detect_hedge = bool(cfg["detect_hedge"])
     block_live = bool(cfg.get("block_live", True))
+    stale_hours_limit = float(cfg.get("stale_hours_limit", 4.0))
     blocked_keywords = cfg["blocked_keywords"]
     now_ts = datetime.now(timezone.utc).timestamp()
 
@@ -505,7 +555,7 @@ def evaluate_cs2_positions(
             or p.get("created_at")
             or p.get("timestamp")
         )
-        last_ago_str = parse_time_info(last_ts)
+        last_ago_str, last_age_hours = parse_time_info(last_ts, now_ts=now_ts)
         url = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
 
         combined_text = f"{title} | {ev_title} | {slug} | {ev_slug}"
@@ -529,6 +579,7 @@ def evaluate_cs2_positions(
                 "entry_cost_usdc": entry_cost,
                 "total_pnl": total_pnl,
                 "last_buy_ago": last_ago_str,
+                "last_age_hours": last_age_hours,
                 "is_live": is_live,
                 "secs_to_start": secs_to_start,
                 "start_countdown": start_countdown,
@@ -664,8 +715,9 @@ def evaluate_cs2_positions(
             rejected_list.append(row)
             continue
 
-        # 7. Đánh giá sổ lệnh CLOB, Hòa vốn Taker & Giá kê Limit tối ưu
-        max_limit_price = min(avg_p + (max_slippage_cents / 100.0), 0.99)
+        # 7. Đánh giá sổ lệnh CLOB, Trượt giá động, Hòa vốn Taker & Stale Signal Guard
+        eff_max_slip_cents = calc_dynamic_max_slip(max_slippage_cents, avg_p)
+        max_limit_price = min(avg_p + (eff_max_slip_cents / 100.0), 0.99)
         max_limit_cents = round(max_limit_price * 100.0, 1)
 
         taker_be_price = calc_taker_breakeven_price(avg_p)
@@ -690,6 +742,8 @@ def evaluate_cs2_positions(
             notes.append("⚠️ Chưa xác minh Gamma")
         if row["secs_to_start"] is not None and 0 < row["secs_to_start"] <= 1800:
             notes.append("⏰ Sắp bắn (<30p)")
+        if eff_max_slip_cents < max_slippage_cents - 1e-6:
+            notes.append(f"📐 Siết trượt giá cửa trên (≤+{eff_max_slip_cents:.1f}¢)")
 
         if parsed_asks:
             best_ask = parsed_asks[0][0]
@@ -705,36 +759,51 @@ def evaluate_cs2_positions(
 
         slippage_cents = round((exec_price - avg_p) * 100.0, 1)
         drop_cents = round((avg_p - exec_price) * 100.0, 1)
-        is_slippage_over = (not is_empty_ask) and (slippage_cents > max_slippage_cents)
+        is_slippage_over = (not is_empty_ask) and (slippage_cents > eff_max_slip_cents)
 
-        # Tính giá kê Limit Maker tối ưu (đứng dưới Best Ask 1 tick để 0% phí, không vượt trần Maker)
-        if not is_empty_ask and not is_slippage_over:
+        # Kiểm tra độ trễ tín hiệu (Stale Signal Guard)
+        last_age_h = row.get("last_age_hours")
+        is_stale_chasing = (
+            last_age_h is not None
+            and last_age_h > stale_hours_limit
+            and slippage_cents > 0.5
+        )
+        if row["secs_to_start"] is None and last_age_h is not None and last_age_h >= 12.0:
+            notes.append(f"⚠️ Thiếu giờ bắn & Tín hiệu >12h — Check Live kỹ")
+
+        # Tính giá kê Limit Maker tối ưu (đứng dưới Best Ask 1 tick để 0% phí)
+        if is_stale_chasing:
+            # Tín hiệu cũ + giá đã chạy: chỉ khuyến nghị kê Limit bằng hoặc dưới giá trung bình ví gốc
+            rec_limit_price = max(0.01, min(round(avg_p, 4), max_limit_price))
+        elif not is_empty_ask and not is_slippage_over:
             rec_limit_price = max(0.01, min(round(exec_price - tick_size, 4), max_limit_price))
         else:
             rec_limit_price = max_limit_price
         rec_limit_cents = round(rec_limit_price * 100.0, 1)
 
-        # Gắn nhãn 3 chế độ khớp lệnh
+        # Gắn nhãn chế độ khớp lệnh
         if is_empty_ask:
             notes.insert(0, f"📋 TRỐNG ASK (Kê {rec_limit_cents:.1f}¢)")
         elif is_slippage_over:
             notes.insert(0, f"🟡 KÊ LIMIT CHỜ ({rec_limit_cents:.1f}¢)")
+        elif is_stale_chasing:
+            notes.insert(0, f"⏳ TÍN HIỆU CŨ ({last_age_h:.1f}h) — KÊ LIMIT ({rec_limit_cents:.1f}¢)")
         elif exec_price <= taker_be_price + 1e-6:
             notes.insert(0, "⚡ TAKER OK")
         else:
             notes.insert(0, f"🎯 KÊ LIMIT ({rec_limit_cents:.1f}¢)")
 
+        if last_age_h is not None and last_age_h > stale_hours_limit and not is_stale_chasing:
+            notes.append(f"⏳ Ví dừng gom {last_age_h:.1f}h trước")
+
         if drop_cents > drop_warn_cents:
             notes.append(f"⚠️ Tụt >{drop_warn_cents:.0f}¢")
-
-        if avg_p < 0.30 and not is_empty_ask and slippage_cents > 1.5:
-            notes.append("Under <30%: Kê <=+1.5¢")
 
         if not is_empty_ask and not is_slippage_over and avail_liq_usdc < final_bet:
             notes.append(f"💧 Ask mỏng (${avail_liq_usdc:.2f})")
 
         est_shares = final_bet / max(rec_limit_price, 0.01)
-        needs_limit = is_empty_ask or is_slippage_over or (exec_price > taker_be_price + 1e-6)
+        needs_limit = is_empty_ask or is_slippage_over or is_stale_chasing or (exec_price > taker_be_price + 1e-6)
         if needs_limit and est_shares < 5.0:
             min_limit_usdc = 5.0 * max(rec_limit_price, 0.01)
             notes.append(f"⚠️ Limit cần >=5sh (~${min_limit_usdc:.2f})")
@@ -746,7 +815,7 @@ def evaluate_cs2_positions(
         row["rec_limit_cents"] = rec_limit_cents
         row["max_limit_cents"] = max_limit_cents
         row["avail_liq_usdc"] = round(avail_liq_usdc, 2)
-        row["action_note"] = " | ".join(notes)
+        row["base_action_note"] = " | ".join(notes)
 
         if is_slippage_over:
             slip_list.append(row)
@@ -764,9 +833,72 @@ def evaluate_cs2_positions(
     }
 
 
+def apply_scale_in_state(
+    df: pd.DataFrame,
+    entered_amounts: dict[str, float],
+    min_user_bet: float,
+) -> tuple[pd.DataFrame, bool]:
+    """
+    Tính toán trạng thái Scale-In (DCA) cho từng dòng:
+    - Nếu đã vào trước đó và ví gốc bơm thêm làm delta_bet >= min_user_bet:
+      tự động bỏ tick 'entered', hiển thị 'bet_to_place = delta_bet' và gắn nhãn '➕ BƠM THÊM'.
+    - Trả về (df_updated, did_migrate_legacy).
+    """
+    if df.empty:
+        return df, False
+
+    did_migrate = False
+    entered_flags: list[bool] = []
+    bet_to_place_list: list[float] = []
+    action_notes: list[str] = []
+
+    for _, r in df.iterrows():
+        pk = r["pos_key"]
+        target_bet = float(r["final_user_bet"])
+        base_note = str(r["base_action_note"])
+
+        if pk in entered_amounts:
+            prev_amt = float(entered_amounts[pk])
+            # Tự động nâng cấp bản ghi legacy (-1.0) sang số vốn mục tiêu hiện tại
+            if prev_amt < 0:
+                entered_amounts[pk] = target_bet
+                prev_amt = target_bet
+                did_migrate = True
+
+            delta_bet = round(target_bet - prev_amt, 2)
+            if delta_bet >= min_user_bet - 1e-6:
+                entered_flags.append(False)
+                bet_to_place_list.append(delta_bet)
+                action_notes.append(
+                    f"➕ BƠM THÊM +${delta_bet:.2f} (Đã vào ${prev_amt:.2f}) | {base_note}"
+                )
+            elif delta_bet > 0.01:
+                entered_flags.append(True)
+                bet_to_place_list.append(0.0)
+                action_notes.append(
+                    f"✅ Đã vào ${prev_amt:.2f} (Dư nhỏ +${delta_bet:.2f} < Min) | {base_note}"
+                )
+            else:
+                entered_flags.append(True)
+                bet_to_place_list.append(0.0)
+                action_notes.append(f"✅ Đã đủ vốn (${prev_amt:.2f}) | {base_note}")
+        else:
+            entered_flags.append(False)
+            bet_to_place_list.append(target_bet)
+            action_notes.append(base_note)
+
+    out = df.copy()
+    out["entered"] = entered_flags
+    out["bet_to_place"] = bet_to_place_list
+    out["action_note"] = action_notes
+    # Đưa các kèo chưa vào / cần bơm thêm lên đầu bảng
+    out = out.sort_values(by=["entered", "bet_to_place"], ascending=[True, False]).reset_index(drop=True)
+    return out, did_migrate
+
+
 # ======================== SESSION STATE INIT ========================
-if "entered_ids" not in st.session_state:
-    st.session_state["entered_ids"] = load_persisted_ids()
+if "entered_amounts" not in st.session_state:
+    st.session_state["entered_amounts"] = load_persisted_amounts()
 if "editor_ver" not in st.session_state:
     st.session_state["editor_ver"] = 0
 if "scan_results" not in st.session_state:
@@ -810,16 +942,32 @@ with st.sidebar:
         key="max_cs2",
     )
 
-    cs2_slip = st.slider("Trượt giá Maker tối đa (¢)", 0.5, 10.0, 2.5, 0.5, key="slip_cs2")
+    cs2_slip = st.slider(
+        "Trượt giá Maker cơ sở (¢)",
+        0.5,
+        10.0,
+        2.5,
+        0.5,
+        key="slip_cs2",
+        help="Tự động siết chặt ở vùng cửa trên theo công thức min(Slip, 12 × (1 - P_whale)).",
+    )
     cs2_drop_warn = st.slider("Cảnh báo giá tụt sâu (¢)", 2.0, 15.0, 5.0, 1.0, key="drop_cs2")
+    cs2_stale_hours = st.slider(
+        "Ngưỡng tín hiệu cũ (giờ)",
+        1.0,
+        12.0,
+        4.0,
+        0.5,
+        key="stale_cs2",
+        help="Nếu ví gốc dừng gom quá số giờ này và giá Ask đã chạy lên, khóa Taker và chỉ kê Limit bằng giá gốc.",
+    )
     cs2_min_prob = st.slider(
         "Sàn kèo cửa dưới tối thiểu (%)",
         5,
         45,
-        15,
+        35,
         5,
         key="min_prob_cs2",
-        help="Chuẩn backtest: 15% (giữ dải 15–50% có kỳ vọng dương mạnh trên ví Whale).",
     )
     cs2_max_fav = st.slider("Chặn kèo chắc ăn trên (%)", 65, 99, 85, 5, key="fav_cs2")
     cs2_block_50_60 = st.checkbox("Chặn dải 50% – 60%", value=True, key="b5060_cs2")
@@ -841,14 +989,14 @@ with st.sidebar:
     st.caption(f"Ngưỡng vốn ví gốc: **${cs2_min_whale:,.0f} – ${cs2_max_whale:,.0f}**")
 
     st.divider()
-    if st.session_state["entered_ids"]:
+    if st.session_state["entered_amounts"]:
         if st.button(
-            f"🧹 Xóa dấu Đã vào ({len(st.session_state['entered_ids'])})",
+            f"🧹 Xóa dấu Đã vào ({len(st.session_state['entered_amounts'])})",
             use_container_width=True,
         ):
-            st.session_state["entered_ids"] = set()
+            st.session_state["entered_amounts"] = {}
             st.session_state["editor_ver"] += 1
-            persist_entered_ids(set(), active_keys=set())
+            persist_entered_amounts({}, active_keys=set())
             st.rerun()
 
 
@@ -870,6 +1018,7 @@ if scan_clicked or st.session_state["scan_results"] is None:
                 "max_user_cap": cs2_max_cap,
                 "max_slippage_cents": cs2_slip,
                 "drop_warn_cents": cs2_drop_warn,
+                "stale_hours_limit": cs2_stale_hours,
                 "min_underdog_prob": cs2_min_prob,
                 "max_fav_prob": cs2_max_fav,
                 "block_50_60": cs2_block_50_60,
@@ -890,7 +1039,7 @@ if scan_clicked or st.session_state["scan_results"] is None:
                 for k_df in ("valid", "slip"):
                     if not res[k_df].empty:
                         active_keys.update(res[k_df]["pos_key"].tolist())
-                st.session_state["entered_ids"] = load_persisted_ids(active_keys)
+                st.session_state["entered_amounts"] = load_persisted_amounts(active_keys)
             except Exception as exc:
                 st.error(f"Lỗi kết nối Polymarket API: {exc}")
 
@@ -901,29 +1050,34 @@ if st.session_state["last_scan_time"]:
 
 res = st.session_state["scan_results"]
 if res is not None:
-    valid_df: pd.DataFrame = res["valid"].copy()
-    slip_df: pd.DataFrame = res["slip"].copy()
+    entered_map: dict[str, float] = st.session_state["entered_amounts"]
+    valid_df, mig_v = apply_scale_in_state(res["valid"], entered_map, cs2_min_bet)
+    slip_df, mig_s = apply_scale_in_state(res["slip"], entered_map, cs2_min_bet)
+
     hedge_df: pd.DataFrame = res["hedge"].copy()
     blocked_df: pd.DataFrame = res["blocked"].copy()
     rejected_df: pd.DataFrame = res["rejected"].copy()
     redeem_cnt: int = res["redeemable_count"]
     dead_zero_cnt: int = res.get("dead_zero_count", 0)
 
-    entered_set: set[str] = st.session_state["entered_ids"]
     active_keys_all: set[str] = set()
     if not valid_df.empty:
         active_keys_all.update(valid_df["pos_key"].tolist())
     if not slip_df.empty:
         active_keys_all.update(slip_df["pos_key"].tolist())
 
+    if mig_v or mig_s:
+        persist_entered_amounts(entered_map, active_keys_all)
+
     remaining_capital = 0.0
+    actionable_valid_cnt = 0
     if not valid_df.empty:
-        remaining_capital = float(
-            valid_df.loc[~valid_df["pos_key"].isin(entered_set), "final_user_bet"].sum()
-        )
+        unfilled_mask = ~valid_df["entered"]
+        remaining_capital = float(valid_df.loc[unfilled_mask, "bet_to_place"].sum())
+        actionable_valid_cnt = int(unfilled_mask.sum())
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("🟢 Kèo hợp lệ ngay", len(valid_df))
+    m1.metric("🟢 Kèo cần vào / bơm thêm", f"{actionable_valid_cnt} / {len(valid_df)}")
     m2.metric("💰 Vốn cần thêm ($)", f"${remaining_capital:.2f}")
     m3.metric("🟡 Quá trượt giá (Limit)", len(slip_df))
     m4.metric("🚫 Giải / Thể thức chặn", len(blocked_df))
@@ -936,13 +1090,13 @@ if res is not None:
     if valid_df.empty:
         st.info("Hiện chưa có kèo CS2 nào khớp đủ quy tắc và nằm trong ngưỡng trượt giá Maker.")
     else:
-        valid_df["entered"] = valid_df["pos_key"].isin(entered_set)
         disp_valid = valid_df[
             [
                 "pos_key",
                 "entered",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -970,6 +1124,7 @@ if res is not None:
                 "entered",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -988,7 +1143,16 @@ if res is not None:
                 "entered": st.column_config.CheckboxColumn("✅ Đã vào", default=False),
                 "title": st.column_config.TextColumn("Trận đấu / Kèo", width="medium"),
                 "outcome": st.column_config.TextColumn("Cửa chọn", width="small"),
-                "final_user_bet": st.column_config.NumberColumn("Tiền bạn vào ($)", format="$%.2f"),
+                "bet_to_place": st.column_config.NumberColumn(
+                    "Vào kỳ này ($)",
+                    format="$%.2f",
+                    help="Số tiền cần vào mới hoặc bơm thêm khi ví gốc DCA.",
+                ),
+                "final_user_bet": st.column_config.NumberColumn(
+                    "Tổng mục tiêu ($)",
+                    format="$%.2f",
+                    help="Tổng quy mô vốn mục tiêu ứng với vị thế hiện tại của ví gốc.",
+                ),
                 "action_note": st.column_config.TextColumn("Chế độ khớp lệnh", width="medium"),
                 "avg_price": st.column_config.NumberColumn("Giá ví gốc (¢)", format="%.1f¢"),
                 "exec_price": st.column_config.NumberColumn("Best Ask (¢)", format="%.1f¢"),
@@ -1006,7 +1170,7 @@ if res is not None:
                 "max_limit_cents": st.column_config.NumberColumn(
                     "🛑 Trần Maker (¢)",
                     format="%.1f¢",
-                    help="Giá tối đa cho phép kê lệnh Limit Maker.",
+                    help="Trần trượt giá động theo tỷ lệ cược.",
                 ),
                 "avail_liq_usdc": st.column_config.NumberColumn("Thanh khoản Ask ($)", format="$%.2f"),
                 "entry_cost_usdc": st.column_config.NumberColumn("Vốn ví gốc ($)", format="$%,.0f"),
@@ -1018,6 +1182,7 @@ if res is not None:
                 "pos_key",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -1034,24 +1199,29 @@ if res is not None:
             ],
         )
 
-        new_entered_valid = set(edited_valid.loc[edited_valid["entered"], "pos_key"].tolist())
-        old_entered_valid = set(disp_valid.loc[disp_valid["entered"], "pos_key"].tolist())
-        if new_entered_valid != old_entered_valid:
-            updated_set = (entered_set - old_entered_valid) | new_entered_valid
-            st.session_state["entered_ids"] = updated_set
-            persist_entered_ids(updated_set, active_keys_all)
+        new_checked_valid = set(edited_valid.loc[edited_valid["entered"], "pos_key"].tolist())
+        old_checked_valid = set(disp_valid.loc[disp_valid["entered"], "pos_key"].tolist())
+        if new_checked_valid != old_checked_valid:
+            target_lookup = dict(zip(disp_valid["pos_key"], disp_valid["final_user_bet"]))
+            for pk in new_checked_valid - old_checked_valid:
+                entered_map[pk] = float(target_lookup.get(pk, 0.0))
+            for pk in old_checked_valid - new_checked_valid:
+                entered_map.pop(pk, None)
+            st.session_state["entered_amounts"] = entered_map
+            st.session_state["editor_ver"] += 1
+            persist_entered_amounts(entered_map, active_keys_all)
             st.rerun()
 
     # --- MỤC 2: KÈO ĐẠT ĐIỀU KIỆN NHƯNG QUÁ TRƯỢT GIÁ ASK ---
     if not slip_df.empty:
         st.subheader(f"🟡 2. Kèo Đạt Điều Kiện Nhưng Quá Trượt Giá Ask ({len(slip_df)})")
-        slip_df["entered"] = slip_df["pos_key"].isin(st.session_state["entered_ids"])
         disp_slip = slip_df[
             [
                 "pos_key",
                 "entered",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -1078,6 +1248,7 @@ if res is not None:
                 "entered",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -1095,7 +1266,8 @@ if res is not None:
                 "entered": st.column_config.CheckboxColumn("✅ Đã kê Limit", default=False),
                 "title": st.column_config.TextColumn("Trận đấu / Kèo", width="medium"),
                 "outcome": st.column_config.TextColumn("Cửa chọn", width="small"),
-                "final_user_bet": st.column_config.NumberColumn("Tiền bạn vào ($)", format="$%.2f"),
+                "bet_to_place": st.column_config.NumberColumn("Vào kỳ này ($)", format="$%.2f"),
+                "final_user_bet": st.column_config.NumberColumn("Tổng mục tiêu ($)", format="$%.2f"),
                 "action_note": st.column_config.TextColumn("Ghi chú", width="medium"),
                 "avg_price": st.column_config.NumberColumn("Giá ví gốc (¢)", format="%.1f¢"),
                 "exec_price": st.column_config.NumberColumn("Best Ask (¢)", format="%.1f¢"),
@@ -1112,6 +1284,7 @@ if res is not None:
                 "pos_key",
                 "title",
                 "outcome",
+                "bet_to_place",
                 "final_user_bet",
                 "action_note",
                 "avg_price",
@@ -1127,12 +1300,17 @@ if res is not None:
             ],
         )
 
-        new_entered_slip = set(edited_slip.loc[edited_slip["entered"], "pos_key"].tolist())
-        old_entered_slip = set(disp_slip.loc[disp_slip["entered"], "pos_key"].tolist())
-        if new_entered_slip != old_entered_slip:
-            updated_set = (st.session_state["entered_ids"] - old_entered_slip) | new_entered_slip
-            st.session_state["entered_ids"] = updated_set
-            persist_entered_ids(updated_set, active_keys_all)
+        new_checked_slip = set(edited_slip.loc[edited_slip["entered"], "pos_key"].tolist())
+        old_checked_slip = set(disp_slip.loc[disp_slip["entered"], "pos_key"].tolist())
+        if new_checked_slip != old_checked_slip:
+            target_lookup = dict(zip(disp_slip["pos_key"], disp_slip["final_user_bet"]))
+            for pk in new_checked_slip - old_checked_slip:
+                entered_map[pk] = float(target_lookup.get(pk, 0.0))
+            for pk in old_checked_slip - new_checked_slip:
+                entered_map.pop(pk, None)
+            st.session_state["entered_amounts"] = entered_map
+            st.session_state["editor_ver"] += 1
+            persist_entered_amounts(entered_map, active_keys_all)
             st.rerun()
 
     # --- MỤC 3: CẢNH BÁO VÍ GỐC ĐANG HEDGE 2 ĐẦU ---
